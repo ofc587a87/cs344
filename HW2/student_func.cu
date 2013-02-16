@@ -112,7 +112,7 @@ void gaussian_blur(const unsigned char* const inputChannel,
 	int currentX=blockIdx.x * blockDim.x + threadIdx.x;
 	    int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-	    //verificamos que estamos dentro de los indices de la imagen (que nos nos hemos salido del borde)
+	    //verificamos que estamos dentro de los indices de la imagen (que no nos hemos salido del borde)
 	    if ( currentX >= numCols || currentY >= numRows )
 	        return;
 
@@ -153,7 +153,7 @@ void separateChannels(const uchar4* const inputImageRGBA,
     int currentX=blockIdx.x * blockDim.x + threadIdx.x;
     int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-    //verificamos que estamos dentro de los índices de la imagen (que nos nos hemos salido del borde)
+    //verificamos que estamos dentro de los indices de la imagen (que no nos hemos salido del borde)
     if ( currentX >= numCols || currentY >= numRows )
         return;
 
