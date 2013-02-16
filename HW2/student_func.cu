@@ -112,12 +112,9 @@ void gaussian_blur(const unsigned char* const inputChannel,
 	int currentX=blockIdx.x * blockDim.x + threadIdx.x;
 	    int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-	    //verificamos que estamos dentro de los indices de la imagen (que no nos hemos salido del borde)
 	    if ( currentX >= numCols || currentY >= numRows )
 	        return;
 
-	    //el filtro va a ser el mismo para todos, asi que lo copio a memoria compartida
-	    //he heco que los bloques coincidan con el filtro, de ahí el tamaño
 	    extern __shared__ float cpyFilter[];
 	    if(threadIdx.y<filterWidth && threadIdx.x < filterWidth)
 	    {
@@ -144,6 +141,53 @@ void gaussian_blur(const unsigned char* const inputChannel,
 	    outputChannel[currentIdx]=sum;
 }
 
+__global__
+void gaussian_blur_combined(const uchar4* inputChannel,
+							uchar4* const outputChannel,
+                   int numRows, int numCols,
+                   const float* const filter, const int filterWidth)
+{
+	int currentX=blockIdx.x * blockDim.x + threadIdx.x;
+	    int currentY=blockIdx.y * blockDim.y + threadIdx.y;
+
+	    if ( currentX >= numCols || currentY >= numRows )
+	        return;
+
+	    extern __shared__ float cpyFilter[];
+	    if(threadIdx.y<filterWidth && threadIdx.x < filterWidth)
+	    {
+	    	int filterPos=threadIdx.y * filterWidth + threadIdx.x;
+	    	cpyFilter[filterPos]=filter[filterPos];
+	    }
+	    __syncthreads();
+
+	    int currentIdx=(currentY * numCols) + currentX;
+	    float sumR=0.f, sumG=0.f, sumB=0.f;
+	    for (int filter_r = -filterWidth/2; filter_r <= filterWidth/2; ++filter_r) {
+	        for (int filter_c = -filterWidth/2; filter_c <= filterWidth/2; ++filter_c) {
+
+	        	int image_r = min(max(currentY + filter_r, 0), static_cast<int>(numRows - 1));
+	        	int image_c = min(max(currentX + filter_c, 0), static_cast<int>(numCols - 1));
+
+	        	uchar4 imagePixel=inputChannel[image_r * numCols + image_c];
+	        	float image_valueR = static_cast<float>(imagePixel.x);
+	        	float image_valueG = static_cast<float>(imagePixel.y);
+	        	float image_valueB = static_cast<float>(imagePixel.z);
+	        	float filter_value = cpyFilter[(filter_r + filterWidth/2) * filterWidth + filter_c + filterWidth/2];
+
+	        	sumR += image_valueR * filter_value;
+	        	sumG += image_valueG * filter_value;
+	        	sumB += image_valueB * filter_value;
+	        }
+	    }
+
+	    uchar4 imagePixel=outputChannel[currentIdx];
+	    imagePixel.x=sumR;
+	    imagePixel.y=sumG;
+	    imagePixel.z=sumB;
+	    outputChannel[currentIdx]=imagePixel;
+}
+
 //This kernel takes in an image represented as a uchar4 and splits
 //it into three images consisting of only one color channel each
 __global__
@@ -157,17 +201,14 @@ void separateChannels(const uchar4* const inputImageRGBA,
     int currentX=blockIdx.x * blockDim.x + threadIdx.x;
     int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-    //verificamos que estamos dentro de los indices de la imagen (que no nos hemos salido del borde)
     if ( currentX >= numCols || currentY >= numRows )
         return;
 
-    //tengo la imagen como un array lineal
     int currentIdx=(currentY * numCols) + currentX;
 
-     //copio a local
+
     uchar4 currentpixel=inputImageRGBA[currentIdx];
 
-    //separo canales
     redChannel[currentIdx]=currentpixel.x;
     greenChannel[currentIdx]=currentpixel.y;
     blueChannel[currentIdx]=currentpixel.z;
@@ -242,43 +283,46 @@ void your_gaussian_blur(const uchar4 * const h_inputImageRGBA, uchar4 * const d_
                         unsigned char *d_blueBlurred,
                         const int filterWidth)
 {
-	  const dim3 blockSize(filterWidth*3, filterWidth*3);
+    int multiplier=3;
+	  const dim3 blockSize(filterWidth*multiplier, filterWidth*multiplier);
 
 	  //TODO:
 	  //Compute correct grid size (i.e., number of blocks per kernel launch)
 	  //from the image size and and block size.
-	  const dim3 gridSize(numRows/3, numCols/3);
+	  const dim3 gridSize((numRows/multiplier)+(multiplier>1?2:0), (numCols/multiplier)+(multiplier>1?2:0));
 
-  //TODO: Launch a kernel for separating the RGBA image into different color channels
-	  /*checkCudaErrors(cudaMemcpy(d_inputImageRGBA, h_inputImageRGBA,
-			  sizeof(uchar4) * numCols *numRows, cudaMemcpyHostToDevice));*/
-	  separateChannels<<<gridSize, blockSize>>>(d_inputImageRGBA, numRows, numCols, d_red, d_green, d_blue);
-
-  // Call cudaDeviceSynchronize(), then call checkCudaErrors() immediately after
-  // launching your kernel to make sure that you didn't make any mistakes.
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  //TODO: Call your convolution kernel here 3 times, once for each color channel.
-  int flterSize=sizeof(float) * filterWidth * filterWidth;
-  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_red, d_redBlurred, numRows, numCols, d_filter, filterWidth);
-  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_green, d_greenBlurred, numRows, numCols, d_filter, filterWidth);
-  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_blue, d_blueBlurred, numRows, numCols, d_filter, filterWidth);
-
-  // Again, call cudaDeviceSynchronize(), then call checkCudaErrors() immediately after
-  // launching your kernel to make sure that you didn't make any mistakes.
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  // Now we recombine your results. We take care of launching this kernel for you.
-  //
-  // NOTE: This kernel launch depends on the gridSize and blockSize variables,
-  // which you must set yourself.
-  recombineChannels<<<gridSize, blockSize>>>(d_redBlurred,
-                                             d_greenBlurred,
-                                             d_blueBlurred,
-                                             d_outputImageRGBA,
-                                             numRows,
-                                             numCols);
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+//  //TODO: Launch a kernel for separating the RGBA image into different color channels
+//	  /*checkCudaErrors(cudaMemcpy(d_inputImageRGBA, h_inputImageRGBA,
+//			  sizeof(uchar4) * numCols *numRows, cudaMemcpyHostToDevice));*/
+//	  separateChannels<<<gridSize, blockSize>>>(d_inputImageRGBA, numRows, numCols, d_red, d_green, d_blue);
+//
+//  // Call cudaDeviceSynchronize(), then call checkCudaErrors() immediately after
+//  // launching your kernel to make sure that you didn't make any mistakes.
+//  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+//
+//  //TODO: Call your convolution kernel here 3 times, once for each color channel.
+//  int flterSize=sizeof(float) * filterWidth * filterWidth;
+//  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_red, d_redBlurred, numRows, numCols, d_filter, filterWidth);
+//  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_green, d_greenBlurred, numRows, numCols, d_filter, filterWidth);
+//  gaussian_blur<<<gridSize, blockSize, flterSize>>>(d_blue, d_blueBlurred, numRows, numCols, d_filter, filterWidth);
+//
+//  // Again, call cudaDeviceSynchronize(), then call checkCudaErrors() immediately after
+//  // launching your kernel to make sure that you didn't make any mistakes.
+//  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+//
+//  // Now we recombine your results. We take care of launching this kernel for you.
+//  //
+//  // NOTE: This kernel launch depends on the gridSize and blockSize variables,
+//  // which you must set yourself.
+//  recombineChannels<<<gridSize, blockSize>>>(d_redBlurred,
+//                                             d_greenBlurred,
+//                                             d_blueBlurred,
+//                                             d_outputImageRGBA,
+//                                             numRows,
+//                                             numCols);
+//  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	  int filterSize=sizeof(float) * filterWidth * filterWidth;
+	  gaussian_blur_combined<<<gridSize, blockSize, filterSize>>>(d_inputImageRGBA, d_outputImageRGBA, numRows, numCols, d_filter, filterWidth);
 
   /****************************************************************************
   * You can use the code below to help with debugging, but make sure to       *
