@@ -112,7 +112,7 @@ void gaussian_blur(const unsigned char* const inputChannel,
 	int currentX=blockIdx.x * blockDim.x + threadIdx.x;
 	    int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-	    //verificamos que estamos dentro de los �dnices de la imagen (que nos nos hemos salido del borde)
+	    //verificamos que estamos dentro de los indices de la imagen (que nos nos hemos salido del borde)
 	    if ( currentX >= numCols || currentY >= numRows )
 	        return;
 
@@ -153,7 +153,7 @@ void separateChannels(const uchar4* const inputImageRGBA,
     int currentX=blockIdx.x * blockDim.x + threadIdx.x;
     int currentY=blockIdx.y * blockDim.y + threadIdx.y;
 
-    //verificamos que estamos dentro de los �dnices de la imagen (que nos nos hemos salido del borde)
+    //verificamos que estamos dentro de los índices de la imagen (que nos nos hemos salido del borde)
     if ( currentX >= numCols || currentY >= numRows )
         return;
 
@@ -246,8 +246,8 @@ void your_gaussian_blur(const uchar4 * const h_inputImageRGBA, uchar4 * const d_
 	  const dim3 gridSize(numRows, numCols);
 
   //TODO: Launch a kernel for separating the RGBA image into different color channels
-	  checkCudaErrors(cudaMemcpy(d_inputImageRGBA, h_inputImageRGBA,
-			  sizeof(uchar4) * numCols *numRows, cudaMemcpyHostToDevice));
+	  /*checkCudaErrors(cudaMemcpy(d_inputImageRGBA, h_inputImageRGBA,
+			  sizeof(uchar4) * numCols *numRows, cudaMemcpyHostToDevice));*/
 	  separateChannels<<<gridSize, blockSize>>>(d_inputImageRGBA, numRows, numCols, d_red, d_green, d_blue);
 
   // Call cudaDeviceSynchronize(), then call checkCudaErrors() immediately after
