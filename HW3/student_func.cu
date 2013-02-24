@@ -160,35 +160,21 @@ __global__ void scanHistogram(const int* const d_bins, unsigned int *result, int
 		sintdata[tid] = d_bins[myId];
 	__syncthreads();            // make sure entire block is loaded!
 
-	//Step 1:
-	// do reduction in shared mem
-	for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+	//Step hillis / Steele
+	for (int step = 1; step<size;step <<= 1)
 	{
-		if (tid < s)
-		{
-			float val1=sintdata[tid];
-			float val2=myId+s>size?0:sintdata[tid + s];
-			sintdata[tid] = val1 + val2;
-		}
-		__syncthreads();        // make sure all adds at one stage are done!
-	}
-
-	//Step 2: doing downsweep
-	sintdata[0] = 0;
-	for (unsigned int s = 1;s<blockDim.x / 2; s <<= 1)
-	{
-		if (tid < s)
+		if (tid >=step)
 		{
 			int val1=sintdata[tid];
-			int val2=myId+s>size?0:sintdata[tid + s];
+			int val2=sintdata[tid - step];
 			sintdata[tid] = val1+val2;
-			if(myId+s<size) sintdata[tid+s] = val1;
 		}
 		__syncthreads();        // make sure all adds at one stage are done!
 	}
 
 	// every thread writes result for this block back to global mem
-	result[blockIdx.x] = sintdata[tid];
+	if(myId<size)
+		result[myId] = sintdata[tid];
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -224,7 +210,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
 	checkCudaErrors(cudaMalloc(&d_intermediate, sizeof(float) * blocks));
 	checkCudaErrors(cudaMalloc(&d_result, sizeof(float)));
 
-	testToneMapping();
+//	testToneMapping();
 
 //	std::cout << "Blocks: " << blocks << std::endl;
 //	std::cout << "Threads: " << threads << std::endl;
@@ -384,7 +370,7 @@ void testToneMapping()
 
 	checkCudaErrors(cudaMemcpy(&h_cdf, d_cdf, sizeof(unsigned int)*(numBins), cudaMemcpyDeviceToHost));
 
-	std::cout <<" CDF: [ ";
+	std::cout <<" CDF ("<< threads<<"t): [ ";
 	for(int i=0;i<numBins;i++)
 		std::cout << h_cdf[i] <<" ";
 	std::cout << "]" << std::endl;
