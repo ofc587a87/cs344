@@ -16,8 +16,7 @@ OPENCV_INCLUDEPATH=/usr/include
 #OPENCV_INCLUDEPATH=/usr/local/include
 
 OPENCV_LIBS=-lopencv_core -lopencv_imgproc -lopencv_highgui
-
-CUDA_INCLUDEPATH=/usr/local/cuda-5.0/include
+CUDA_INCLUDEPATH=/opt/cuda/include -I /opt/cuda/sdk/common/inc/
 
 ######################################################
 # On Macs the default install locations are below    #
@@ -29,6 +28,8 @@ CUDA_INCLUDEPATH=/usr/local/cuda-5.0/include
 NVCC_OPTS=-O3 -arch=sm_20 -Xcompiler -Wall -Xcompiler -Wextra -m64
 
 GCC_OPTS=-O3 -Wall -Wextra -m64
+
+all: student
 
 student: compare main.o student_func.o HW3.o loadSaveImage.o Makefile
 	$(NVCC) -o hw main.o student_func.o HW3.o loadSaveImage.o -L $(OPENCV_LIBPATH) $(OPENCV_LIBS) $(NVCC_OPTS)

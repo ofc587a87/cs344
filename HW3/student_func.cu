@@ -82,6 +82,114 @@
 
 #include "reference_calc.cpp"
 #include "utils.h"
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+void testToneMapping();
+
+
+__global__ void reduceLuminance(const float* const d_logLuminance, bool isMax, float *result, int size)
+{
+//	// sdata is allocated in the kernel call: 3rd arg to <<<b, t, shmem>>>
+	extern __shared__ float sdata[];
+
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	int tid  = threadIdx.x;
+
+	// load shared mem from global mem
+	if(myId<size)
+		sdata[tid] = d_logLuminance[myId];
+	__syncthreads();            // make sure entire block is loaded!
+
+	float identity=isMax?0:9999999999999;
+
+	// do reduction in shared mem
+	for (int s = blockDim.x / 2; s > 0; s >>= 1)
+	{
+		if (tid < s)
+		{
+			float val1=sdata[tid];
+			float val2=myId+s>size?identity:sdata[tid + s];
+			if(isMax)
+			{
+				if(val1>val2)
+					sdata[tid]=val1;
+				else
+					sdata[tid]=val2;
+			}
+			else
+			{
+				if(val1<val2)
+					sdata[tid]=val1;
+				else
+					sdata[tid]=val2;
+			}
+		}
+		__syncthreads();        // make sure all adds at one stage are done!
+	}
+
+	// only thread 0 writes result for this block back to global mem
+	if (tid == 0)
+	{
+		result[blockIdx.x] = sdata[0];
+	}
+}
+
+__global__ void assignHistogram(int *d_bins, const float *d_in, int BIN_COUNT, float lumRange, float lumMin)
+{
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+
+    //bin = (lum[i] - lumMin) / lumRange * numBins
+    int myBin = ((float)(d_in[myId] - lumMin) / (float)lumRange * BIN_COUNT);
+    if(myBin>=BIN_COUNT)
+    	myBin=BIN_COUNT-1;
+    atomicAdd(&(d_bins[myBin]), 1);
+}
+
+
+__global__ void scanHistogram(const int* const d_bins, unsigned int *result, int size)
+{
+//	// sdata is allocated in the kernel call: 3rd arg to <<<b, t, shmem>>>
+	extern __shared__ int sintdata[];
+
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	int tid  = threadIdx.x;
+
+	// load shared mem from global mem
+	if(myId<size)
+		sintdata[tid] = d_bins[myId];
+	__syncthreads();            // make sure entire block is loaded!
+
+	//Step 1:
+	// do reduction in shared mem
+	for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+	{
+		if (tid < s)
+		{
+			float val1=sintdata[tid];
+			float val2=myId+s>size?0:sintdata[tid + s];
+			sintdata[tid] = val1 + val2;
+		}
+		__syncthreads();        // make sure all adds at one stage are done!
+	}
+
+	//Step 2: doing downsweep
+	sintdata[0] = 0;
+	for (unsigned int s = 1;s<blockDim.x / 2; s <<= 1)
+	{
+		if (tid < s)
+		{
+			int val1=sintdata[tid];
+			int val2=myId+s>size?0:sintdata[tid + s];
+			sintdata[tid] = val1+val2;
+			if(myId+s<size) sintdata[tid+s] = val1;
+		}
+		__syncthreads();        // make sure all adds at one stage are done!
+	}
+
+	// every thread writes result for this block back to global mem
+	result[blockIdx.x] = sintdata[tid];
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -101,6 +209,83 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+
+	// Two step reduce
+	// 1 dimension!!
+	int size=numRows * numCols;
+	const int maxThreadsPerBlock = 1024;
+	int threads = maxThreadsPerBlock;
+	int blocks = size / maxThreadsPerBlock;
+
+	const int STEP1_SHMEM_SIZE=threads * sizeof(float);
+	const int STEP2_SHMEM_SIZE=blocks * sizeof(float);
+
+	float *d_intermediate, *d_result;
+	checkCudaErrors(cudaMalloc(&d_intermediate, sizeof(float) * blocks));
+	checkCudaErrors(cudaMalloc(&d_result, sizeof(float)));
+
+	testToneMapping();
+
+//	std::cout << "Blocks: " << blocks << std::endl;
+//	std::cout << "Threads: " << threads << std::endl;
+
+	//TUNING IDEA: MIN AND MAX AT THE SAME TIME
+
+	/* Step 1a: Reduce on d_logLuminance with MIN Operation to get min luminance value*/
+	reduceLuminance<<<blocks, threads, STEP1_SHMEM_SIZE>>>(d_logLuminance, false, d_intermediate, size);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	reduceLuminance<<<1, blocks, STEP2_SHMEM_SIZE>>>(d_intermediate, false, d_result, size);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaMemcpy(&min_logLum, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+
+	/* Step 1b: Reduce on d_logLuminance with MAX Operation to get max luminance value*/
+	reduceLuminance<<<blocks, threads, STEP1_SHMEM_SIZE>>>(d_logLuminance, true, d_intermediate, size);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	reduceLuminance<<<1, blocks, STEP2_SHMEM_SIZE>>>(d_intermediate, true, d_result, size);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaMemcpy(&max_logLum, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+
+	// Step 2: calc range
+	float range=max_logLum-min_logLum;
+
+//	std::cout << "Min value: " << min_logLum << std::endl;
+//	std::cout << "Max value: " << max_logLum << std::endl;
+//	std::cout << "Range: " << range << std::endl;
+//	std::cout << "Num bins: " << numBins << std::endl;
+
+
+	//step 3: Histogram
+	int *d_bins;
+	checkCudaErrors(cudaMalloc(&d_bins, sizeof(int) * numBins));
+	checkCudaErrors(cudaMemset(d_bins, 0, sizeof(int) * numBins));
+	assignHistogram<<<size/threads, threads>>>(d_bins, d_logLuminance, numBins, range, min_logLum);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+//	First 25 bins example
+//
+//	int h_bins[numBins];
+//	checkCudaErrors(cudaMemcpy(&h_bins, d_bins, sizeof(int) * numBins, cudaMemcpyDeviceToHost));
+//	for(int i=0;i<25;i++)
+//	{
+//		std::cout << " - " << i << ": " << h_bins[i] << std::endl;
+//	}
+
+	//Last Step: Exclusive Scan on d_bins
+
+	threads=2;
+	while(threads<numBins)
+		threads<<=1;
+	scanHistogram<<<1, threads, sizeof(int) * numBins>>>(d_bins, d_cdf, numBins);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+
+
+	//free resources
+
+	cudaFree(d_intermediate);
+	cudaFree(d_result);
+	cudaFree(d_bins);
+
 
 
 
@@ -132,3 +317,82 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
   delete[] h_cdf; 
   delete[] h_your_cdf; */
 }
+
+
+void testToneMapping()
+{
+	float dataToReduce[]={2, 4, 3, 3, 1, 7, 4, 5, 7, 0, 9, 4, 3, 2};
+	float min=0, max=0, range=0;
+	int numBins=3;
+	int threads=2;
+	int SIZE=sizeof(dataToReduce)/sizeof(dataToReduce[0]);
+	while(threads<SIZE)
+		threads<<=1;
+
+	//Step 1
+
+	float *d_in, *d_out;
+	checkCudaErrors(cudaMalloc(&d_in, sizeof(float) * SIZE));
+	checkCudaErrors(cudaMalloc(&d_out, sizeof(float)));
+	checkCudaErrors(cudaMemcpy(d_in, dataToReduce, sizeof(float) * SIZE, cudaMemcpyHostToDevice));
+
+	reduceLuminance<<<1, threads, sizeof(float)*SIZE>>>(d_in, false, d_out, SIZE);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	checkCudaErrors(cudaMemcpy(&min, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+
+	std::cout << "Minimo: "<<min << std::endl;
+
+	reduceLuminance<<<1, threads, sizeof(float)*SIZE>>>(d_in, true, d_out, SIZE);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	checkCudaErrors(cudaMemcpy(&max, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+
+	range=max-min;
+	std::cout << "Maximo: "<<max << std::endl;
+	std::cout << "Rango: "<<range << std::endl;
+
+
+	int *d_bins, h_bins[numBins];
+	unsigned int *d_cdf, h_cdf[numBins];
+	checkCudaErrors(cudaMalloc(&d_bins, sizeof(int) * (numBins)));
+	checkCudaErrors(cudaMemset(d_bins, 0, sizeof(int) * (numBins)));
+	checkCudaErrors(cudaMalloc(&d_cdf, sizeof(unsigned int) * (numBins)));
+	checkCudaErrors(cudaMemset(d_cdf, 0, sizeof(unsigned int) * (numBins)));
+	assignHistogram<<<1, SIZE>>>(d_bins, d_in, numBins, range, min);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	checkCudaErrors(cudaMemcpy(&h_bins, d_bins, sizeof(int)*(numBins), cudaMemcpyDeviceToHost));
+
+	std::cout <<" Entrada ("<< SIZE << "): [ ";
+		for(int i=0;i<SIZE;i++)
+			std::cout << dataToReduce[i] <<" ";
+		std::cout << "]" << std::endl;
+
+
+	std::cout <<" histograma: [ ";
+	for(int i=0;i<numBins;i++)
+		std::cout << h_bins[i] <<" ";
+	std::cout << "]" << std::endl;
+
+
+	threads=2;
+	while(threads<numBins)
+		threads<<=1;
+	scanHistogram<<<1, threads, sizeof(int) * numBins>>>(d_bins, d_cdf, numBins);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	checkCudaErrors(cudaMemcpy(&h_cdf, d_cdf, sizeof(unsigned int)*(numBins), cudaMemcpyDeviceToHost));
+
+	std::cout <<" CDF: [ ";
+	for(int i=0;i<numBins;i++)
+		std::cout << h_cdf[i] <<" ";
+	std::cout << "]" << std::endl;
+
+	cudaFree(d_cdf);
+	cudaFree(d_bins);
+	cudaFree(d_in);
+	cudaFree(d_out);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+}
+
