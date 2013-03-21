@@ -200,6 +200,79 @@ __global__ void sortPixelsSegmented(unsigned int* const d_inputVals,
 	__syncthreads();
 }
 
+// Busqueda dicotomica
+__device__ int searchInArray(unsigned int value, unsigned int *s_dataVals, int idxStartSearch, int size, size_t numElems, bool isSecondArray, bool falsea)
+{
+	int index=0;
+
+	for(int split=(size>>1);;split=(split>>1))
+	{
+		if((idxStartSearch + split) > numElems)
+			break;
+
+		unsigned int compareValue=s_dataVals[idxStartSearch  + split];
+
+		if(value > compareValue)
+		{
+			idxStartSearch+=split;
+			index+=(split==0?1:split);
+		}
+		else if(isSecondArray and (value - compareValue==0))
+		{
+			index+=1;
+		}
+		if(split==0) break; //hemos llegado al final
+	}
+	return index;
+}
+
+__global__ void joinSegmented(unsigned int *s_dataVals, unsigned int *s_dataPos, const size_t numElems)
+{
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	//int tid  = threadIdx.x;
+
+	if(myId>=numElems) return;
+
+	int maxSize=blockDim.x *gridDim.x; //asumimos que es potencia de 2
+	int currentSize=blockDim.x;
+
+	int i=0;
+	int MAX=2;
+	while(i<MAX)
+	{
+		i++;
+		//indices de los arrays que corresponden a este elemento
+		int idxFirstArray=floorf(myId/(currentSize*2)) * currentSize * 2;
+		int idxSecondArray=idxFirstArray + currentSize;
+
+		//TODO: Usar shared memory
+		unsigned int myValue=s_dataVals[myId];
+		unsigned int myPos=s_dataPos[myId];
+		__syncthreads();
+
+		if(i<MAX)
+		{
+
+			bool isSecondArray=(myId>=idxSecondArray);
+			int idxCurrentArray=(isSecondArray?(myId - idxSecondArray):(myId - idxFirstArray));
+			int idxOtherArray=(idxSecondArray>numElems)?0:searchInArray(myValue, s_dataVals, (isSecondArray?idxFirstArray: idxSecondArray), currentSize, numElems, isSecondArray, i==MAX);
+			int newIndex=idxCurrentArray+idxOtherArray;
+			__syncthreads(); //esperamos a que todos los threads sepan a donde deben ir con su dato
+
+			//establezco el nuevo dato
+			s_dataVals[idxFirstArray + newIndex] = myValue;
+			s_dataPos[idxFirstArray + newIndex] = myValue;
+		}
+		else
+		{
+			s_dataVals[myId]=s_dataPos[myId];
+			//s_dataPos[myId]=newIndex;
+		}
+		__syncthreads(); //esperamos a que todos los threads hayan terminado
+
+		currentSize*=2;
+	}
+}
 
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
@@ -333,20 +406,28 @@ void testSort()
 	cudaMemcpy(d_dataVals, h_dataVals, bytesSize, cudaMemcpyHostToDevice);
 
 	print("Original data", h_data, numElems);
-	print_is_zero("Original ZERO", h_data, numElems, 0);
+	//print_is_zero("Original ZERO", h_data, numElems, 0);
 	//print("Original values", h_dataVals, numElems);
 
-	unsigned int NUM_BLOCKS=3;
-	unsigned int NUM_THREADS=5;
-	unsigned int BYTES_PER_ARRAY = NUM_BLOCKS * NUM_THREADS * sizeof(unsigned int);
+	const unsigned int NUM_BLOCKS=8;
+	const unsigned int NUM_THREADS=2;
+	const unsigned int BYTES_PER_ARRAY = NUM_BLOCKS * NUM_THREADS * sizeof(unsigned int);
 
+	//MERGE SORT: Step 1, sort inside block
 	sortPixelsSegmented<<<NUM_BLOCKS, NUM_THREADS, 3 * BYTES_PER_ARRAY>>>(d_dataVals, d_data, d_outputVals, d_outputPos, numElems);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
+	print("- Output data (segmented)", h_outputVals, numElems);
+
+	//MERGE SORT: Step 2, join segments
+	joinSegmented<<<NUM_BLOCKS, NUM_THREADS>>>(d_outputVals, d_outputPos, numElems);
 	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
 	cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
 	cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
 	print("- Output data", h_outputVals, numElems);
-	//print("Output values", h_outputVals, numElems);
+	print("- Output pos ", h_outputPos, numElems);
 
 
 	free(h_outputVals);
