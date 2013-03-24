@@ -12,10 +12,10 @@
 #include <iomanip>
 #include <thrust/host_vector.h>
 
-void testSort();
+//void testSort();
 
 
-std::string format(int number)
+std::string format(unsigned int number)
 {
 	std::ostringstream oss;
 	oss << std::setfill(' ') << std::setw(3) << number;
@@ -29,6 +29,17 @@ void print(char *message, unsigned int *data, unsigned int numElems)
 	{
 		bool isOk=i==0 || data[i-1]<=data[i];
 		std::cout << " " <<(isOk?"":"\033[1;31m") << format(data[i]) <<(isOk?"":"\033[0m") << " ";
+	}
+	std::cout <<"]"<<std::endl;
+}
+
+void printFilter(char *message, unsigned int *data, unsigned int numElems, unsigned int maxValue)
+{
+	std::cout << "\033[1;32m" << message <<"\033[0m: [";
+	for(unsigned int i=0;i<numElems;i++)
+	{
+		if(data[i]>maxValue)
+		std::cout << " \033[1;31m" << format(data[i]) <<"\033[0m" << " (POS: "<<i<<")";
 	}
 	std::cout <<"]"<<std::endl;
 }
@@ -71,39 +82,37 @@ void print(char *message, unsigned int *data, unsigned int numElems)
 
  */
 
-bool h_isBitByRight(unsigned int number, unsigned int bitIndex)
-{
-	unsigned int comparator=(1 << bitIndex);
-	return (number & comparator) == comparator;
-}
-
 __device__ bool isBitByRight(unsigned int number, unsigned int bitIndex)
 {
 	unsigned int comparator=(1 << bitIndex);
 	return (number & comparator) == comparator;
 }
 
-__device__ void calcHistogram(unsigned int const s_dataVals[], unsigned int s_histogram[], unsigned int iteration, const size_t numElems)
+__device__ int calcHistogram(unsigned int const *s_dataVals, unsigned int iteration, const size_t numElems)
 {
 	int myId = threadIdx.x + blockDim.x * blockIdx.x;
 	int tid  = threadIdx.x;
+	__shared__ int s_histogram;
+	if(tid==0)
+		s_histogram=0;
+	__syncthreads();
 
 	if(myId<numElems)
 	{
-		bool isOne=isBitByRight(s_dataVals[tid], iteration);
-		atomicAdd(&(s_histogram[isOne?1:0]), 1);
+		if(!isBitByRight(s_dataVals[tid], iteration))
+			atomicAdd(&s_histogram, 1); //calculamos los ceros para saber donde empezaran los unos
 	}
-
 	__syncthreads();
+
+	return s_histogram;
 }
 
-__device__ void compact(unsigned int const *s_dataVals,
-        unsigned int const indexSecondArray,
+__device__ void compact(unsigned int const *s_dataVals, unsigned int const indexSecondArray,
         const size_t numElems, unsigned int iteration,
-        unsigned int* s_intermediate, unsigned int *s_scatterAddress)
+        unsigned int* s_intermediate, unsigned int *d_scatterAddress)
 {
-	int myId = threadIdx.x + blockDim.x * blockIdx.x;
-	int tid  = threadIdx.x;
+	unsigned int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	unsigned int tid  = threadIdx.x;
 
 	if(myId<numElems)
 	{
@@ -115,17 +124,19 @@ __device__ void compact(unsigned int const *s_dataVals,
 
 		//scan using predicate to compute scatter address
 		//Step hillis / Steele
-		for (int step = 1; step<blockDim.x;step <<= 1)
+		for (unsigned int step = 1; step<blockDim.x;step <<= 1)
 		{
+			unsigned int value=s_intermediate[tid - step];
+			__syncthreads();
 			if (tid >=step)
-			{
-				s_intermediate[tid] += s_intermediate[tid - step];
-			}
+				s_intermediate[tid] += value;
+
 			__syncthreads();        // make sure all adds at one stage are done!
 		}
 		//copy yo final scatter address
 		if(!isOne)
-			s_scatterAddress[tid]=s_intermediate[tid]-1;
+			d_scatterAddress[myId]=s_intermediate[tid]-1;
+		__syncthreads();
 
 		//step 2: evaluate value 1
 		s_intermediate[tid] = isOne?1:0;
@@ -135,160 +146,105 @@ __device__ void compact(unsigned int const *s_dataVals,
 		//Step hillis / Steele
 		for (int step = 1; step<blockDim.x;step <<= 1)
 		{
+			unsigned int value=s_intermediate[tid - step];
+			__syncthreads();
 			if (tid >=step)
-			{
-				s_intermediate[tid] += s_intermediate[tid - step];
-			}
+				s_intermediate[tid] +=value;
 			__syncthreads();        // make sure all adds at one stage are done!
 		}
 
-		//copy yo final scatter address
+		//copy to final scatter address
 		if(isOne)
-			s_scatterAddress[tid]=indexSecondArray + s_intermediate[tid]-1;
-
+			d_scatterAddress[myId]=indexSecondArray + s_intermediate[tid]-1;
 
 		__syncthreads();
 
 	}
-
 }
 
-__device__ void scatter(unsigned int* const s_inputVals, unsigned int* s_outputVals,
-		unsigned int* s_scatterAddress, const size_t numElems)
+__global__ void radixBlock(unsigned int *d_dataVals, unsigned int *d_dataPos,
+						   unsigned int *d_histogram, unsigned int *d_scatterAddress,
+						   const size_t numElems, int iteration)
+{
+	unsigned int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	unsigned int tid  = threadIdx.x;
+
+	//copia datos del bloque a ordenar
+	extern __shared__ unsigned int s_dataVals[];
+	unsigned int *s_intermediate=s_dataVals+blockDim.x;
+	s_dataVals[tid]=d_dataVals[myId];
+	s_intermediate[tid]=0;
+	__syncthreads();
+
+	//calcula el indice con bit 1 para el histograma
+	int histogramIndex=calcHistogram(s_dataVals, iteration, numElems);
+	__syncthreads();
+
+	if(tid==0)
+		d_histogram[blockIdx.x]=histogramIndex;
+
+	compact(s_dataVals, histogramIndex, numElems, iteration, s_intermediate, d_scatterAddress);
+}
+
+__global__ void calcScatterAddress(unsigned int *d_scaterAddress, const unsigned int *d_histogram,
+		                           const unsigned int totalHistogram, const size_t numElems, const int BLOCK_SIZE)
+{
+	int tid=threadIdx.x;
+
+	extern __shared__ unsigned s_data[];
+	unsigned int *s_histogram_ZERO=s_data;
+	unsigned int *s_histogram_ONE=s_data + blockDim.x;
+
+	//copy histogram to shared memory
+	//Whe want an exclusive Scan, so copy data SHIFTED (first zero, others tid-1)
+	unsigned int localData=tid==0?0:(d_histogram[tid-1]);
+	s_histogram_ZERO[tid]=tid==0?0:localData-1; //histogram is count elements, but address starts a zero, so quit 1
+	s_histogram_ONE[tid] = BLOCK_SIZE - localData; //ONEs doesn't need to be shifted
+	__syncthreads();
+
+	//Inclusive scan of both arrays (but it's exclusive as the data is sifted)
+	//Step hillis / Steele
+	for (int step = 1; step<BLOCK_SIZE;step <<= 1)
+	{
+		if (tid >=step)
+		{
+			s_histogram_ZERO[tid] += s_histogram_ZERO[tid - step];
+			s_histogram_ONE[tid] += s_histogram_ONE[tid - step];
+		}
+		__syncthreads();        // make sure all adds at one stage are done!
+	}
+
+	//calc global scatter address
+	//each thread modifys one block
+	int from=tid * BLOCK_SIZE;
+	int barrier=d_histogram[tid];
+	for(int i=0;i<BLOCK_SIZE;i++)
+	{
+		if(i<barrier) //ZEROS
+			d_scaterAddress[from + i] += s_histogram_ZERO[tid];
+		else
+			d_scaterAddress[from + i] += s_histogram_ONE[tid] + totalHistogram;
+
+//		d_scaterAddress[from + i]=barrier;
+	}
+}
+
+__global__ void scater(unsigned int *d_dataVals, unsigned int *d_dataPos,
+		               unsigned int *d_outputVals, unsigned int *d_outputPos,
+					   unsigned int *d_scatterAddress, const size_t numElems)
 {
 	int myId = threadIdx.x + blockDim.x * blockIdx.x;
-	int tid  = threadIdx.x;
-
 	if(myId<numElems)
 	{
-		unsigned int address=s_scatterAddress[tid];
-		s_outputVals[address]=s_inputVals[tid];
-		//s_outputVals[tid]=address;
-	}
-}
-
-__global__ void sortPixelsSegmented(unsigned int* const d_inputVals, unsigned int* const d_inputPos,
-        unsigned int* const d_outputVals, unsigned int* const d_outputPos,
-        const size_t numElems)
-{
-	const unsigned int numIterations=sizeof(unsigned int) * 8;
-
-	// shared memory data
-	__shared__ unsigned int s_histogram[2];
-	extern __shared__ unsigned int s_dataCopy[]; //vals and pos concatenated
-
-	unsigned int *s_dataVals=s_dataCopy;
-	unsigned int *s_dataPos=s_dataCopy + blockDim.x;
-	unsigned int *s_intermediate=s_dataPos + blockDim.x;
-	unsigned int *s_scatterAddress=s_intermediate + blockDim.x;
-
-	int myId = threadIdx.x + blockDim.x * blockIdx.x;
-	int tid  = threadIdx.x;
-
-	//copy data to shared memory
-	if(myId>numElems) return;
-	s_dataVals[tid] = d_inputVals[myId];
-	s_dataPos[tid] = d_inputPos[myId];
-
-	for(unsigned int iteration=0;iteration<numIterations;iteration++)
-	{
-		if(tid<2)
-			s_histogram[tid]=0;
-		__syncthreads();
-
-		//each thread is realted to one element
-		//Step 1: Histogram
-		calcHistogram(s_dataVals, s_histogram, iteration, numElems);
-		__syncthreads();
-
-		//Step 2: Compact t calc scatter address
-		compact(s_dataVals, s_histogram[0], numElems, iteration, s_intermediate, s_scatterAddress);
-		__syncthreads();
-
-		//step 3: scatter
-		scatter(s_dataVals, s_intermediate, s_scatterAddress, numElems);
-		__syncthreads();
-		s_dataVals[tid]=s_intermediate[tid];
-		__syncthreads();
-
-		scatter(s_dataPos, s_intermediate, s_scatterAddress, numElems);
-		__syncthreads();
-		s_dataPos[tid]=s_intermediate[tid];
-		__syncthreads();
-
+		unsigned int address=d_scatterAddress[myId];
+		if(address<numElems)
+		{
+			d_outputVals[address]=d_dataVals[myId];
+			d_outputPos[address]=d_dataPos[myId];
+		}
 	}
 
-
-	//copy data back from shared memory
-	d_outputVals[myId]=s_dataVals[tid];
-	d_outputPos[myId]=s_dataPos[tid];
-	__syncthreads();
 }
-
-// Busqueda dicotomica
-__device__ int searchInArray(unsigned const int value, unsigned int *s_dataVals, int const idxStartSearch,
-		int const size, const size_t numElems, const bool isSecondArray)
-{
-	int index=0, searchIndex=idxStartSearch;
-
-
-	for(int split=(size>>1);;split=(split>>1))
-	{
-		if((searchIndex + split) > numElems)
-		{
-			if(split==0)
-				break;
-			else
-				continue;
-		}
-
-		unsigned int compareValue=s_dataVals[searchIndex  + split];
-
-		if(value > compareValue)
-		{
-			searchIndex+=split;
-			index+=(split==0?1:split);
-		}
-		else if(isSecondArray and (value - compareValue==0))
-		{
-			index+=1;
-		}
-		if(split==0) break; //hemos llegado al final
-	}
-	return index;
-}
-
-__global__ void joinSegmented(unsigned int *s_dataVals, unsigned int *s_dataPos, const size_t numElems, const int i)
-{
-	int myId = threadIdx.x + blockDim.x * blockIdx.x;
-	//int tid  = threadIdx.x;
-
-	if(myId>=numElems) return;
-
-	//int maxSize=blockDim.x *gridDim.x; //asumimos que es potencia de 2
-	int currentSize=blockDim.x << i;
-
-	//indices de los arrays que corresponden a este elemento
-	int idxFirstArray=floorf(myId/(currentSize*2)) * currentSize * 2;
-	int idxSecondArray=idxFirstArray + currentSize;
-
-	//TODO: Usar shared memory
-	unsigned int myValue=s_dataVals[myId];
-	unsigned int myPos=s_dataPos[myId];
-	syncthreads();
-
-	bool isSecondArray=(myId>=idxSecondArray);
-	int idxCurrentArray=(isSecondArray?(myId - idxSecondArray):(myId - idxFirstArray));
-	int idxOtherArray=(idxSecondArray>numElems)?0:searchInArray(myValue, s_dataVals, (isSecondArray?idxFirstArray: idxSecondArray), currentSize, numElems, isSecondArray);
-	int newIndex=idxCurrentArray+idxOtherArray;
-	syncthreads(); //esperamos a que todos los threads sepan a donde deben ir con su dato
-
-	//establezco el nuevo dato
-	s_dataVals[idxFirstArray + newIndex] = myValue;
-	s_dataPos[idxFirstArray + newIndex] = myPos;
-	syncthreads();
-}
-
 
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
@@ -324,48 +280,100 @@ void your_sort(unsigned int* const d_inputVals,
 //                        numElems);
 
 
-	testSort();
+//	testSort();
 
-//
-//	const unsigned int NUM_THREADS=50;
-//	unsigned int NUM_BLOCKS=ceil(((double)numElems / (double)NUM_THREADS));
-//	unsigned int powof2 = 1;
-//	// Double powof2 until >= val
-//	while( powof2 < NUM_BLOCKS ) powof2 <<= 1;
-//	NUM_BLOCKS=powof2;
-//
-//
-//	const unsigned int BYTES_PER_ARRAY = NUM_THREADS * sizeof(unsigned int);
-//
-//	std::cout << "NUM_THREADS: "<<NUM_THREADS<<std::endl;
-//	std::cout << "NUM_BLOCKS: "<<NUM_BLOCKS<<std::endl;
-//	std::cout << "numElems: "<<numElems<<std::endl;
-//	std::cout << "BYTES_PER_ARRAY: "<<BYTES_PER_ARRAY<<std::endl;
-//
-//	int bytesSize=sizeof(unsigned int)*numElems;
-//	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
-//	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
-//	sortPixelsSegmented<<<NUM_BLOCKS, NUM_THREADS, 4 * BYTES_PER_ARRAY>>>(d_inputVals, d_inputPos, d_outputVals, d_outputPos, numElems);
-//	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-//	cudaMemcpy(h_inputVals2, d_inputVals, bytesSize, cudaMemcpyDeviceToHost);
-//	cudaMemcpy(h_outputVals2, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
-//
-//	print("Orig", h_inputVals2, NUM_THREADS);
-//	print("Data", h_outputVals2, NUM_THREADS);
-//
-//
-//	int numIterations=ceil(log2((float)NUM_BLOCKS));
-//
-//	std::cout << "numIterations: "<<numIterations<<std::endl;
-//
-//	for(int i=0;i<numIterations;i++)
-//	{
-//		joinSegmented<<<NUM_BLOCKS, NUM_THREADS>>>(d_outputVals, d_outputPos, numElems, i);
-//		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-//	}
-//
-//	free(h_inputVals2);
-//	free(h_outputVals2);
+
+	const unsigned int NUM_THREADS=256;
+	unsigned int NUM_BLOCKS=ceil(((double)numElems / (double)NUM_THREADS));
+	const unsigned int BYTES_PER_ARRAY=NUM_THREADS * sizeof(unsigned int);
+
+	unsigned int powof2 = 1;
+	// Double powof2 until >= val
+	while( powof2 < NUM_BLOCKS ) powof2 <<= 1;
+	NUM_BLOCKS=powof2;
+
+
+	//const unsigned int BYTES_PER_ARRAY = NUM_THREADS * sizeof(unsigned int);
+
+	std::cout << "NUM_THREADS: "<<NUM_THREADS<<std::endl;
+	std::cout << "NUM_BLOCKS: "<<NUM_BLOCKS<<std::endl;
+	std::cout << "numElems: "<<numElems<<std::endl;
+	std::cout << "BYTES_PER_ARRAY: "<<BYTES_PER_ARRAY<<std::endl;
+
+	unsigned int *d_histogram, *d_scatterAddress, *d_inputTempVals, *d_inputTempPos;
+	cudaMalloc(&d_scatterAddress, sizeof(unsigned int) * numElems);
+	cudaMalloc(&d_histogram, sizeof(unsigned int) * NUM_BLOCKS);
+	cudaMalloc(&d_inputTempVals, sizeof(unsigned int) * numElems);
+	cudaMalloc(&d_inputTempPos, sizeof(unsigned int) * numElems);
+
+	int bytesSize=sizeof(unsigned int)*numElems;
+	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
+	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
+
+	const unsigned int numIterations=sizeof(unsigned int) * 8;
+	cudaMemcpy(d_inputTempVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(d_inputTempPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+	for(unsigned int iteration=0;iteration<numIterations;iteration++)
+	{
+		std::cout << "Iteration "<<iteration<<" of "<<numIterations<<std::endl;
+		//Step 1: Histogram and order local block
+		cudaMemset(d_histogram, 0, sizeof(unsigned int) * NUM_BLOCKS);
+		cudaMemset(d_scatterAddress, 0, sizeof(unsigned int) * numElems);
+		radixBlock<<<NUM_BLOCKS, NUM_THREADS, BYTES_PER_ARRAY * 2>>>(d_inputTempVals, d_inputTempPos, d_histogram, d_scatterAddress, numElems,  iteration);
+		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+		//fast calc: total histogram
+		unsigned int totalHistogram=0;
+		unsigned int h_histogram[NUM_BLOCKS];
+		cudaMemcpy(h_histogram, d_histogram, sizeof(unsigned int) * NUM_BLOCKS, cudaMemcpyDeviceToHost);
+		for(unsigned int i=0;i<NUM_BLOCKS;i++)
+			totalHistogram+=h_histogram[i];
+
+		unsigned int h_scater[numElems];
+		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+		//std::cout << " TOTAL HISTOGRAM: " << totalHistogram<<std::endl;
+		//print("SCATER BEFORE:  ", h_scater, 135);
+		printFilter("SCATER ERRORS BEFORE:  ", h_scater, numElems, NUM_THREADS-1);
+
+		//Steo 2: calc scater address
+		calcScatterAddress<<<1, NUM_BLOCKS, NUM_BLOCKS * sizeof(unsigned int) * 2>>>(d_scatterAddress, d_histogram, totalHistogram, numElems, NUM_THREADS);
+		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+		printFilter("\n\n\nSCATER ERRORS:  ", h_scater, numElems, numElems-1);
+
+
+		//step 3: scater!
+		scater<<<NUM_BLOCKS, NUM_THREADS>>>(d_inputTempVals, d_inputTempPos, d_outputVals, d_outputPos, d_scatterAddress, numElems);
+		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	}
+
+
+	cudaMemcpy(h_inputVals2, d_inputVals, bytesSize, cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_outputVals2, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
+
+	print("Orig", h_inputVals2, NUM_THREADS);
+	print("Data", h_outputVals2, NUM_THREADS);
+
+
+/*	int numIterations=ceil(log2((float)NUM_BLOCKS));
+
+	std::cout << "numIterations: "<<numIterations<<std::endl;
+
+	for(int i=0;i<numIterations;i++)
+	{
+		joinSegmented<<<NUM_BLOCKS, NUM_THREADS>>>(d_outputVals, d_outputPos, numElems, i);
+		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	}*/
+
+
+	free(h_inputVals2);
+	free(h_outputVals2);
+	cudaFree(d_histogram);
+	cudaFree(d_scatterAddress);
+	cudaFree(d_inputTempVals);
+	cudaFree(d_inputTempPos);
 
 
   /* *********************************************************************** *
@@ -386,81 +394,81 @@ void your_sort(unsigned int* const d_inputVals,
 
 
 
-void testSort()
-{
-	std::cout<<"--------------------------"<<std::endl;
-
-//	const size_t numElems = 13;
-//	unsigned int h_data[]={32, 5, 23, 54, 55, 33, 12, 34, 4, 6, 123, 213, 44};
-//	unsigned int h_dataVals[]={32, 5, 23, 54, 55, 33, 12, 34, 4, 6, 123, 213, 44};
-	const size_t numElems = 50;
-	unsigned int h_data[] ={1040146228, 1040124922, 1040087966, 1040044167, 1040060259, 1040191523, 1040281730, 1040321287,
-						   1040439347, 1040511719, 1040534712, 1040482053, 1040379127, 1040260380, 1040082964, 1039836996,
-						   1039601849, 1039367071, 1039218350, 1039287569, 1039483561, 1039791413, 1040074985, 1040079855,
-						   1039744906, 1039356991, 1039396067, 1039691868, 1040032759, 1040168105, 1040144074, 1040102826,
-						   1040159349, 1040218642, 1040290902, 1040404583, 1040492144, 1040470157 ,1040405164 ,1040378600,
-						   1040259132 ,1040168513 ,1040126140 ,1040122880 ,1040122680 ,1040122331 ,1040114162 ,1040092632,
-						   1040026226 ,1039921833 };
-	unsigned int h_dataVals[] ={1040146228, 1040124922, 1040087966, 1040044167, 1040060259, 1040191523, 1040281730, 1040321287,
-						   1040439347, 1040511719, 1040534712, 1040482053, 1040379127, 1040260380, 1040082964, 1039836996,
-						   1039601849, 1039367071, 1039218350, 1039287569, 1039483561, 1039791413, 1040074985, 1040079855,
-						   1039744906, 1039356991, 1039396067, 1039691868, 1040032759, 1040168105, 1040144074, 1040102826,
-						   1040159349, 1040218642, 1040290902, 1040404583, 1040492144, 1040470157 ,1040405164 ,1040378600,
-						   1040259132 ,1040168513 ,1040126140 ,1040122880 ,1040122680 ,1040122331 ,1040114162 ,1040092632,
-						   1040026226 ,1039921833 };
-	int bytesSize=sizeof(unsigned int)*numElems;
-	unsigned int *h_outputPos=(unsigned int *)malloc(sizeof(unsigned int)*numElems);
-	unsigned int *h_outputVals=(unsigned int *)malloc(sizeof(unsigned int)*numElems);
-
-	unsigned int *d_data, *d_dataVals, *d_outputPos, *d_outputVals;
-	cudaMalloc(&d_data, bytesSize);
-	cudaMalloc(&d_dataVals, bytesSize);
-	cudaMalloc(&d_outputPos, bytesSize);
-	cudaMalloc(&d_outputVals, bytesSize);
-	cudaMemcpy(d_data, h_data, bytesSize, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dataVals, h_dataVals, bytesSize, cudaMemcpyHostToDevice);
-
-	print("- Original data", h_data, numElems);
-	//print_is_zero("Original ZERO", h_data, numElems, 0);
-	print("Original values", h_dataVals, numElems);
-	std::cout<<"--------------------------"<<std::endl;
-
-	const unsigned int NUM_BLOCKS=16;
-	const unsigned int NUM_THREADS=4;
-	const unsigned int BYTES_PER_ARRAY = NUM_BLOCKS * NUM_THREADS * sizeof(unsigned int);
-
-	//MERGE SORT: Step 1, sort inside block
-	sortPixelsSegmented<<<NUM_BLOCKS, NUM_THREADS, 4 * BYTES_PER_ARRAY>>>(d_dataVals, d_data, d_outputVals, d_outputPos, numElems);
-	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-	cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
-	cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
-	print("S - Output pos.", h_outputPos, numElems);
-	print("S - Output data", h_outputVals, numElems);
-
-	//MERGE SORT: Step 2, join segments
-	int numIterations=ceil(log2((float)NUM_BLOCKS));
-	for(int i=0;i<numIterations;i++)
-	{
-		std::cout<<"--------------------------"<<std::endl;
-		joinSegmented<<<NUM_BLOCKS, NUM_THREADS>>>(d_outputVals, d_outputPos, numElems, i);
-		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-		cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
-		char iter[20];
-		sprintf(iter, "%d - Output pos.", i);
-		print(iter, h_outputPos, numElems);
-		sprintf(iter, "%d - Output data", i);
-		print(iter, h_outputVals, numElems);
-	}
-
-	std::cout<<"--------------------------"<<std::endl;
-
-	free(h_outputVals);
-	free(h_outputPos);
-	checkCudaErrors(cudaFree(d_data));
-	checkCudaErrors(cudaFree(d_dataVals));
-	checkCudaErrors(cudaFree(d_outputPos));
-	checkCudaErrors(cudaFree(d_outputVals));
-}
+//void testSort()
+//{
+//	std::cout<<"--------------------------"<<std::endl;
+//
+////	const size_t numElems = 13;
+////	unsigned int h_data[]={32, 5, 23, 54, 55, 33, 12, 34, 4, 6, 123, 213, 44};
+////	unsigned int h_dataVals[]={32, 5, 23, 54, 55, 33, 12, 34, 4, 6, 123, 213, 44};
+//	const size_t numElems = 50;
+//	unsigned int h_data[] ={1040146228, 1040124922, 1040087966, 1040044167, 1040060259, 1040191523, 1040281730, 1040321287,
+//						   1040439347, 1040511719, 1040534712, 1040482053, 1040379127, 1040260380, 1040082964, 1039836996,
+//						   1039601849, 1039367071, 1039218350, 1039287569, 1039483561, 1039791413, 1040074985, 1040079855,
+//						   1039744906, 1039356991, 1039396067, 1039691868, 1040032759, 1040168105, 1040144074, 1040102826,
+//						   1040159349, 1040218642, 1040290902, 1040404583, 1040492144, 1040470157 ,1040405164 ,1040378600,
+//						   1040259132 ,1040168513 ,1040126140 ,1040122880 ,1040122680 ,1040122331 ,1040114162 ,1040092632,
+//						   1040026226 ,1039921833 };
+//	unsigned int h_dataVals[] ={1040146228, 1040124922, 1040087966, 1040044167, 1040060259, 1040191523, 1040281730, 1040321287,
+//						   1040439347, 1040511719, 1040534712, 1040482053, 1040379127, 1040260380, 1040082964, 1039836996,
+//						   1039601849, 1039367071, 1039218350, 1039287569, 1039483561, 1039791413, 1040074985, 1040079855,
+//						   1039744906, 1039356991, 1039396067, 1039691868, 1040032759, 1040168105, 1040144074, 1040102826,
+//						   1040159349, 1040218642, 1040290902, 1040404583, 1040492144, 1040470157 ,1040405164 ,1040378600,
+//						   1040259132 ,1040168513 ,1040126140 ,1040122880 ,1040122680 ,1040122331 ,1040114162 ,1040092632,
+//						   1040026226 ,1039921833 };
+//	int bytesSize=sizeof(unsigned int)*numElems;
+//	unsigned int *h_outputPos=(unsigned int *)malloc(sizeof(unsigned int)*numElems);
+//	unsigned int *h_outputVals=(unsigned int *)malloc(sizeof(unsigned int)*numElems);
+//
+//	unsigned int *d_data, *d_dataVals, *d_outputPos, *d_outputVals;
+//	cudaMalloc(&d_data, bytesSize);
+//	cudaMalloc(&d_dataVals, bytesSize);
+//	cudaMalloc(&d_outputPos, bytesSize);
+//	cudaMalloc(&d_outputVals, bytesSize);
+//	cudaMemcpy(d_data, h_data, bytesSize, cudaMemcpyHostToDevice);
+//	cudaMemcpy(d_dataVals, h_dataVals, bytesSize, cudaMemcpyHostToDevice);
+//
+//	print("- Original data", h_data, numElems);
+//	//print_is_zero("Original ZERO", h_data, numElems, 0);
+//	print("Original values", h_dataVals, numElems);
+//	std::cout<<"--------------------------"<<std::endl;
+//
+//	const unsigned int NUM_BLOCKS=16;
+//	const unsigned int NUM_THREADS=4;
+//	const unsigned int BYTES_PER_ARRAY = NUM_BLOCKS * NUM_THREADS * sizeof(unsigned int);
+//
+//	//MERGE SORT: Step 1, sort inside block
+//	sortPixelsSegmented<<<NUM_BLOCKS, NUM_THREADS, 4 * BYTES_PER_ARRAY>>>(d_dataVals, d_data, d_outputVals, d_outputPos, numElems);
+//	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+//	cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
+//	cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
+//	print("S - Output pos.", h_outputPos, numElems);
+//	print("S - Output data", h_outputVals, numElems);
+//
+//	//MERGE SORT: Step 2, join segments
+//	int numIterations=ceil(log2((float)NUM_BLOCKS));
+//	for(int i=0;i<numIterations;i++)
+//	{
+//		std::cout<<"--------------------------"<<std::endl;
+//		joinSegmented<<<NUM_BLOCKS, NUM_THREADS>>>(d_outputVals, d_outputPos, numElems, i);
+//		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+//
+//		cudaMemcpy(h_outputPos, d_outputPos, bytesSize, cudaMemcpyDeviceToHost);
+//		cudaMemcpy(h_outputVals, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
+//		char iter[20];
+//		sprintf(iter, "%d - Output pos.", i);
+//		print(iter, h_outputPos, numElems);
+//		sprintf(iter, "%d - Output data", i);
+//		print(iter, h_outputVals, numElems);
+//	}
+//
+//	std::cout<<"--------------------------"<<std::endl;
+//
+//	free(h_outputVals);
+//	free(h_outputPos);
+//	checkCudaErrors(cudaFree(d_data));
+//	checkCudaErrors(cudaFree(d_dataVals));
+//	checkCudaErrors(cudaFree(d_outputPos));
+//	checkCudaErrors(cudaFree(d_outputVals));
+//}
 
