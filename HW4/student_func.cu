@@ -22,10 +22,10 @@ std::string format(unsigned int number)
 	return oss.str();
 }
 
-void print(char *message, unsigned int *data, unsigned int numElems)
+void print(char *message, unsigned int *data, unsigned int fromElem, unsigned int numElems)
 {
 	std::cout << "\033[1;32m" << message <<"\033[0m: [";
-	for(unsigned int i=0;i<numElems;i++)
+	for(unsigned int i=fromElem;i<numElems;i++)
 	{
 		bool isOk=i==0 || data[i-1]<=data[i];
 		std::cout << " " <<(isOk?"":"\033[1;31m") << format(data[i]) <<(isOk?"":"\033[0m") << " ";
@@ -186,46 +186,74 @@ __global__ void radixBlock(unsigned int *d_dataVals, unsigned int *d_dataPos,
 	compact(s_dataVals, histogramIndex, numElems, iteration, s_intermediate, d_scatterAddress);
 }
 
-__global__ void calcScatterAddress(unsigned int *d_scaterAddress, const unsigned int *d_histogram,
-		                           const unsigned int totalHistogram, const size_t numElems, const int BLOCK_SIZE)
+__global__ void calcScatterAddress(unsigned int *d_scaterAddress, unsigned int *d_histogram,
+		                           const unsigned int totalHistogram, const size_t numElems,
+		                           unsigned const int BLOCK_SIZE, unsigned const int maxRealBlocks)
 {
-	int tid=threadIdx.x;
+	unsigned int tid=threadIdx.x;
 
 	extern __shared__ unsigned s_data[];
 	unsigned int *s_histogram_ZERO=s_data;
 	unsigned int *s_histogram_ONE=s_data + blockDim.x;
 
+	//limit histogram size
+	int blockSize=BLOCK_SIZE;
+	if(tid==maxRealBlocks)
+	{
+		blockSize=numElems % BLOCK_SIZE;
+	}
+
+
 	//copy histogram to shared memory
 	//Whe want an exclusive Scan, so copy data SHIFTED (first zero, others tid-1)
+	int barrier=d_histogram[tid];
 	unsigned int localData=tid==0?0:(d_histogram[tid-1]);
 	s_histogram_ZERO[tid]=tid==0?0:localData-1; //histogram is count elements, but address starts a zero, so quit 1
-	s_histogram_ONE[tid] = BLOCK_SIZE - localData; //ONEs doesn't need to be shifted
+	s_histogram_ONE[tid] = tid==0?0:blockSize - localData; //ONEs doesn't need to be shifted
+	if(tid>maxRealBlocks)
+		s_histogram_ONE[tid]=0;
 	__syncthreads();
 
 	//Inclusive scan of both arrays (but it's exclusive as the data is sifted)
 	//Step hillis / Steele
 	for (int step = 1; step<BLOCK_SIZE;step <<= 1)
 	{
+		unsigned int val_ZERO=0, val_ONE=0;
 		if (tid >=step)
 		{
-			s_histogram_ZERO[tid] += s_histogram_ZERO[tid - step];
-			s_histogram_ONE[tid] += s_histogram_ONE[tid - step];
+			val_ZERO=s_histogram_ZERO[tid - step];
+			val_ONE=s_histogram_ONE[tid - step];
+		}
+		__syncthreads();
+
+		if (tid >=step)
+		{
+			s_histogram_ZERO[tid] += val_ZERO;
+			s_histogram_ONE[tid] += val_ONE;
 		}
 		__syncthreads();        // make sure all adds at one stage are done!
 	}
 
+	s_histogram_ONE[tid]+=totalHistogram - barrier;
+	d_histogram[tid]=s_histogram_ONE[tid];
+	__syncthreads();
+
 	//calc global scatter address
 	//each thread modifys one block
 	int from=tid * BLOCK_SIZE;
-	int barrier=d_histogram[tid];
+
 	for(int i=0;i<BLOCK_SIZE;i++)
 	{
-		if(i<barrier) //ZEROS
-			d_scaterAddress[from + i] += s_histogram_ZERO[tid];
-		else
-			d_scaterAddress[from + i] += s_histogram_ONE[tid] + totalHistogram;
+		if((from+i)>numElems)
+			break;
 
-//		d_scaterAddress[from + i]=barrier;
+		unsigned int value=d_scaterAddress[from + i];
+		if(value < barrier)
+			value+= s_histogram_ZERO[tid];
+		else
+			value+=s_histogram_ONE[tid];
+		d_scaterAddress[from + i]=value;
+		//d_scaterAddress[from + i]=localData;
 	}
 }
 
@@ -281,16 +309,14 @@ void your_sort(unsigned int* const d_inputVals,
 
 
 //	testSort();
-
-
-	const unsigned int NUM_THREADS=256;
-	unsigned int NUM_BLOCKS=ceil(((double)numElems / (double)NUM_THREADS));
+	const unsigned int NUM_THREADS=1024;
+	unsigned int MAX_REAL_BLOCKS=ceil(((double)numElems / (double)NUM_THREADS));
 	const unsigned int BYTES_PER_ARRAY=NUM_THREADS * sizeof(unsigned int);
 
 	unsigned int powof2 = 1;
 	// Double powof2 until >= val
-	while( powof2 < NUM_BLOCKS ) powof2 <<= 1;
-	NUM_BLOCKS=powof2;
+	while( powof2 < MAX_REAL_BLOCKS ) powof2 <<= 1;
+	unsigned int NUM_BLOCKS=powof2;
 
 
 	//const unsigned int BYTES_PER_ARRAY = NUM_THREADS * sizeof(unsigned int);
@@ -307,14 +333,15 @@ void your_sort(unsigned int* const d_inputVals,
 	cudaMalloc(&d_inputTempPos, sizeof(unsigned int) * numElems);
 
 	int bytesSize=sizeof(unsigned int)*numElems;
-	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
-	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
+	cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
 
 	const unsigned int numIterations=sizeof(unsigned int) * 8;
-	cudaMemcpy(d_inputTempVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
-	cudaMemcpy(d_inputTempPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
 	for(unsigned int iteration=0;iteration<numIterations;iteration++)
 	{
+		cudaMemcpy(d_inputTempVals, d_outputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+		cudaMemcpy(d_inputTempPos, d_outputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+
 		std::cout << "Iteration "<<iteration<<" of "<<numIterations<<std::endl;
 		//Step 1: Histogram and order local block
 		cudaMemset(d_histogram, 0, sizeof(unsigned int) * NUM_BLOCKS);
@@ -329,17 +356,24 @@ void your_sort(unsigned int* const d_inputVals,
 		for(unsigned int i=0;i<NUM_BLOCKS;i++)
 			totalHistogram+=h_histogram[i];
 
+//		print("HISTOGRAM", h_histogram, 0, MAX_REAL_BLOCKS);
+
 		unsigned int h_scater[numElems];
 		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
-		//std::cout << " TOTAL HISTOGRAM: " << totalHistogram<<std::endl;
-		//print("SCATER BEFORE:  ", h_scater, 135);
+		std::cout << " TOTAL HISTOGRAM: " << totalHistogram<<std::endl;
+//		print("SCATER BEFORE:  ", h_scater, 220000, numElems);
 		printFilter("SCATER ERRORS BEFORE:  ", h_scater, numElems, NUM_THREADS-1);
 
 		//Steo 2: calc scater address
-		calcScatterAddress<<<1, NUM_BLOCKS, NUM_BLOCKS * sizeof(unsigned int) * 2>>>(d_scatterAddress, d_histogram, totalHistogram, numElems, NUM_THREADS);
+		calcScatterAddress<<<1, NUM_BLOCKS, NUM_BLOCKS * sizeof(unsigned int) * 2>>>(d_scatterAddress, d_histogram, totalHistogram, numElems, NUM_THREADS, MAX_REAL_BLOCKS);
 		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
+//		cudaMemcpy(h_histogram, d_histogram, sizeof(unsigned int) * NUM_BLOCKS, cudaMemcpyDeviceToHost);
+//		print("HISTOGRAM SCAN:", h_histogram, 0, MAX_REAL_BLOCKS);
+
+
 		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+//		print("SCATER AFTER:  ", h_scater, 220000, numElems);
 		printFilter("\n\n\nSCATER ERRORS:  ", h_scater, numElems, numElems-1);
 
 
@@ -349,12 +383,17 @@ void your_sort(unsigned int* const d_inputVals,
 
 	}
 
+	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
+	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
 
 	cudaMemcpy(h_inputVals2, d_inputVals, bytesSize, cudaMemcpyDeviceToHost);
 	cudaMemcpy(h_outputVals2, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
 
-	print("Orig", h_inputVals2, NUM_THREADS);
-	print("Data", h_outputVals2, NUM_THREADS);
+	std::cout << "ORIG DATA LOCATION: " << d_inputVals<<std::endl;
+	std::cout << "OUTP DATA LOCATION: " << d_outputVals<<std::endl;
+
+	print("Orig", h_inputVals2, 0, NUM_THREADS);
+	print("Data", h_outputVals2, 0, NUM_THREADS);
 
 
 /*	int numIterations=ceil(log2((float)NUM_BLOCKS));
