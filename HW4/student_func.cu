@@ -7,42 +7,42 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <stdio.h>
-#include <sstream>
-#include <string>
-#include <iomanip>
+//#include <sstream>
+//#include <string>
+//#include <iomanip>
 #include <thrust/host_vector.h>
 
 //void testSort();
 
 
-std::string format(unsigned int number)
-{
-	std::ostringstream oss;
-	oss << std::setfill(' ') << std::setw(3) << number;
-	return oss.str();
-}
-
-void print(char *message, unsigned int *data, unsigned int fromElem, unsigned int numElems)
-{
-	std::cout << "\033[1;32m" << message <<"\033[0m: [";
-	for(unsigned int i=fromElem;i<numElems;i++)
-	{
-		bool isOk=i==0 || data[i-1]<=data[i];
-		std::cout << " " <<(isOk?"":"\033[1;31m") << format(data[i]) <<(isOk?"":"\033[0m") << " ";
-	}
-	std::cout <<"]"<<std::endl;
-}
-
-void printFilter(char *message, unsigned int *data, unsigned int numElems, unsigned int maxValue)
-{
-	std::cout << "\033[1;32m" << message <<"\033[0m: [";
-	for(unsigned int i=0;i<numElems;i++)
-	{
-		if(data[i]>maxValue)
-		std::cout << " \033[1;31m" << format(data[i]) <<"\033[0m" << " (POS: "<<i<<")";
-	}
-	std::cout <<"]"<<std::endl;
-}
+//std::string format(unsigned int number)
+//{
+//	std::ostringstream oss;
+//	oss << std::setfill(' ') << std::setw(3) << number;
+//	return oss.str();
+//}
+//
+//void print(char *message, unsigned int *data, unsigned int fromElem, unsigned int numElems)
+//{
+//	std::cout << "\033[1;32m" << message <<"\033[0m: [";
+//	for(unsigned int i=fromElem;i<numElems;i++)
+//	{
+//		bool isOk=i==0 || data[i-1]<=data[i];
+//		std::cout << " " <<(isOk?"":"\033[1;31m") << format(data[i]) <<(isOk?"":"\033[0m") << " ";
+//	}
+//	std::cout <<"]"<<std::endl;
+//}
+//
+//void printFilter(char *message, unsigned int *data, unsigned int numElems, unsigned int maxValue)
+//{
+//	std::cout << "\033[1;32m" << message <<"\033[0m: [";
+//	for(unsigned int i=0;i<numElems;i++)
+//	{
+//		if(data[i]>maxValue)
+//		std::cout << " \033[1;31m" << format(data[i]) <<"\033[0m" << " (POS: "<<i<<")";
+//	}
+//	std::cout <<"]"<<std::endl;
+//}
 
 /* Red Eye Removal
    ===============
@@ -208,7 +208,7 @@ __global__ void calcScatterAddress(unsigned int *d_scaterAddress, unsigned int *
 	//Whe want an exclusive Scan, so copy data SHIFTED (first zero, others tid-1)
 	int barrier=d_histogram[tid];
 	unsigned int localData=tid==0?0:(d_histogram[tid-1]);
-	s_histogram_ZERO[tid]=tid==0?0:localData-1; //histogram is count elements, but address starts a zero, so quit 1
+	s_histogram_ZERO[tid]=tid==0?0:localData; //histogram is count elements, but address starts a zero, so quit 1
 	s_histogram_ONE[tid] = tid==0?0:blockSize - localData; //ONEs doesn't need to be shifted
 	if(tid>maxRealBlocks)
 		s_histogram_ONE[tid]=0;
@@ -235,7 +235,7 @@ __global__ void calcScatterAddress(unsigned int *d_scaterAddress, unsigned int *
 	}
 
 	s_histogram_ONE[tid]+=totalHistogram - barrier;
-	d_histogram[tid]=s_histogram_ONE[tid];
+	//d_histogram[tid]=s_histogram_ONE[tid];
 	__syncthreads();
 
 	//calc global scatter address
@@ -309,7 +309,7 @@ void your_sort(unsigned int* const d_inputVals,
 
 
 //	testSort();
-	const unsigned int NUM_THREADS=1024;
+	const unsigned int NUM_THREADS=512;
 	unsigned int MAX_REAL_BLOCKS=ceil(((double)numElems / (double)NUM_THREADS));
 	const unsigned int BYTES_PER_ARRAY=NUM_THREADS * sizeof(unsigned int);
 
@@ -321,31 +321,32 @@ void your_sort(unsigned int* const d_inputVals,
 
 	//const unsigned int BYTES_PER_ARRAY = NUM_THREADS * sizeof(unsigned int);
 
-	std::cout << "NUM_THREADS: "<<NUM_THREADS<<std::endl;
-	std::cout << "NUM_BLOCKS: "<<NUM_BLOCKS<<std::endl;
-	std::cout << "numElems: "<<numElems<<std::endl;
-	std::cout << "BYTES_PER_ARRAY: "<<BYTES_PER_ARRAY<<std::endl;
-
-	unsigned int *d_histogram, *d_scatterAddress, *d_inputTempVals, *d_inputTempPos;
-	cudaMalloc(&d_scatterAddress, sizeof(unsigned int) * numElems);
-	cudaMalloc(&d_histogram, sizeof(unsigned int) * NUM_BLOCKS);
-	cudaMalloc(&d_inputTempVals, sizeof(unsigned int) * numElems);
-	cudaMalloc(&d_inputTempPos, sizeof(unsigned int) * numElems);
+//	std::cout << "NUM_THREADS: "<<NUM_THREADS<<std::endl;
+//	std::cout << "NUM_BLOCKS: "<<NUM_BLOCKS<<std::endl;
+//	std::cout << "numElems: "<<numElems<<std::endl;
+//	std::cout << "BYTES_PER_ARRAY: "<<BYTES_PER_ARRAY<<std::endl;
 
 	int bytesSize=sizeof(unsigned int)*numElems;
-	cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
-	cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+
+	unsigned int *d_histogram, *d_scatterAddress, *d_inputTempVals, *d_inputTempPos;
+	cudaMalloc(&d_scatterAddress, bytesSize);
+	cudaMalloc(&d_histogram, sizeof(unsigned int) * NUM_BLOCKS);
+	cudaMalloc(&d_inputTempVals, bytesSize);
+	cudaMalloc(&d_inputTempPos, bytesSize);
+
+	cudaMemcpy(d_outputVals, d_inputVals, bytesSize, cudaMemcpyDeviceToDevice);
+	cudaMemcpy(d_outputPos, d_inputPos, bytesSize, cudaMemcpyDeviceToDevice);
 
 	const unsigned int numIterations=sizeof(unsigned int) * 8;
 	for(unsigned int iteration=0;iteration<numIterations;iteration++)
 	{
-		cudaMemcpy(d_inputTempVals, d_outputVals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
-		cudaMemcpy(d_inputTempPos, d_outputPos, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice);
+		cudaMemcpy(d_inputTempVals, d_outputVals, bytesSize, cudaMemcpyDeviceToDevice);
+		cudaMemcpy(d_inputTempPos, d_outputPos, bytesSize, cudaMemcpyDeviceToDevice);
 
-		std::cout << "Iteration "<<iteration<<" of "<<numIterations<<std::endl;
+//		std::cout << "Iteration "<<iteration<<" of "<<numIterations<<std::endl;
 		//Step 1: Histogram and order local block
 		cudaMemset(d_histogram, 0, sizeof(unsigned int) * NUM_BLOCKS);
-		cudaMemset(d_scatterAddress, 0, sizeof(unsigned int) * numElems);
+		cudaMemset(d_scatterAddress, 0, bytesSize);
 		radixBlock<<<NUM_BLOCKS, NUM_THREADS, BYTES_PER_ARRAY * 2>>>(d_inputTempVals, d_inputTempPos, d_histogram, d_scatterAddress, numElems,  iteration);
 		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
@@ -358,11 +359,11 @@ void your_sort(unsigned int* const d_inputVals,
 
 //		print("HISTOGRAM", h_histogram, 0, MAX_REAL_BLOCKS);
 
-		unsigned int h_scater[numElems];
-		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
-		std::cout << " TOTAL HISTOGRAM: " << totalHistogram<<std::endl;
-//		print("SCATER BEFORE:  ", h_scater, 220000, numElems);
-		printFilter("SCATER ERRORS BEFORE:  ", h_scater, numElems, NUM_THREADS-1);
+//		unsigned int h_scater[numElems];
+//		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+//		std::cout << " TOTAL HISTOGRAM: " << totalHistogram<<std::endl;
+////		print("SCATER BEFORE:  ", h_scater, 220000, numElems);
+//		printFilter("SCATER ERRORS BEFORE:  ", h_scater, numElems, NUM_THREADS-1);
 
 		//Steo 2: calc scater address
 		calcScatterAddress<<<1, NUM_BLOCKS, NUM_BLOCKS * sizeof(unsigned int) * 2>>>(d_scatterAddress, d_histogram, totalHistogram, numElems, NUM_THREADS, MAX_REAL_BLOCKS);
@@ -372,9 +373,9 @@ void your_sort(unsigned int* const d_inputVals,
 //		print("HISTOGRAM SCAN:", h_histogram, 0, MAX_REAL_BLOCKS);
 
 
-		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
-//		print("SCATER AFTER:  ", h_scater, 220000, numElems);
-		printFilter("\n\n\nSCATER ERRORS:  ", h_scater, numElems, numElems-1);
+//		cudaMemcpy(h_scater, d_scatterAddress, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost);
+////		print("SCATER AFTER:  ", h_scater, 220000, numElems);
+//		printFilter("\n\n\nSCATER ERRORS:  ", h_scater, numElems, numElems-1);
 
 
 		//step 3: scater!
@@ -383,17 +384,17 @@ void your_sort(unsigned int* const d_inputVals,
 
 	}
 
-	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
-	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
-
-	cudaMemcpy(h_inputVals2, d_inputVals, bytesSize, cudaMemcpyDeviceToHost);
-	cudaMemcpy(h_outputVals2, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
-
-	std::cout << "ORIG DATA LOCATION: " << d_inputVals<<std::endl;
-	std::cout << "OUTP DATA LOCATION: " << d_outputVals<<std::endl;
-
-	print("Orig", h_inputVals2, 0, NUM_THREADS);
-	print("Data", h_outputVals2, 0, NUM_THREADS);
+//	unsigned int *h_outputVals2=(unsigned int *)malloc(bytesSize);
+//	unsigned int *h_inputVals2=(unsigned int *)malloc(bytesSize);
+//
+//	cudaMemcpy(h_inputVals2, d_inputVals, bytesSize, cudaMemcpyDeviceToHost);
+//	cudaMemcpy(h_outputVals2, d_outputVals, bytesSize, cudaMemcpyDeviceToHost);
+//
+//	std::cout << "ORIG DATA LOCATION: " << d_inputVals<<std::endl;
+//	std::cout << "OUTP DATA LOCATION: " << d_outputVals<<std::endl;
+//
+//	print("Orig", h_inputVals2, 0, NUM_THREADS);
+//	print("Data", h_outputVals2, 0, NUM_THREADS);
 
 
 /*	int numIterations=ceil(log2((float)NUM_BLOCKS));
@@ -407,8 +408,8 @@ void your_sort(unsigned int* const d_inputVals,
 	}*/
 
 
-	free(h_inputVals2);
-	free(h_outputVals2);
+//	free(h_inputVals2);
+//	free(h_outputVals2);
 	cudaFree(d_histogram);
 	cudaFree(d_scatterAddress);
 	cudaFree(d_inputTempVals);
